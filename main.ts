@@ -10,7 +10,7 @@
 // every step below is deterministic: no timestamps, no random choices, no
 // dependence on the order the filesystem happens to list things in.
 
-import { cpSync, existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { cpSync, mkdirSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { buildDossier } from './vendor/makefun-game.ts';
@@ -43,12 +43,11 @@ function repoRoot(): string {
   return dirname(fileURLToPath(import.meta.url));
 }
 
-// Start from a clean slate so a stale file from an earlier run can never
-// leak into this entry.
-function resetOutputDir(outDir: string): void {
-  if (existsSync(outDir)) {
-    rmSync(outDir, { recursive: true, force: true });
-  }
+// Make sure the output folder exists. Never delete it: the grader
+// provides /output as a writable mount point and running as uid 65534
+// cannot remove it (EACCES on rmdir /output). This follows the starter
+// kit pattern: mkdir only, then copy into it.
+function ensureOutputDir(outDir: string): void {
   mkdirSync(outDir, { recursive: true });
 }
 
@@ -81,7 +80,7 @@ function writeDossier(outDir: string): number {
 function handInEntry(): void {
   const root = repoRoot();
   const outDir = pickOutputDir();
-  resetOutputDir(outDir);
+  ensureOutputDir(outDir);
   const staged: Record<string, number> = {};
   for (const treeName of HANDED_IN_TREES) {
     staged[treeName] = stageTree(root, treeName, outDir);
