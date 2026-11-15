@@ -1,22 +1,19 @@
-// Everything the player sees: the night field, the path, the towers, the Gloam,
-// the HUD and every menu. The renderer never changes the rules; it only paints
-// the state game.js hands it, in the fixed 1280x720 logical field scaled to the
-// window. It also owns the clickable rectangles (uiHit), so a click lands where
-// the player sees the button.
-import { EMBER, FIELD, FONT, MAX_LEVEL, PALETTE, TOWERS, TOWER_ORDER, WAVE_COUNT } from './config.js';
-import { PATH, PLOTS } from './level.js';
-import { sellValue, towerStats, upgradeCost } from './towers.js';
-import { SCREEN_DEFEAT, SCREEN_PAUSED, SCREEN_PLAY, SCREEN_TITLE, SCREEN_VICTORY } from './game.js';
+// Emberlight Keep — canvas rendering. All art is drawn in code;
+// no images, no external assets.
 
-const HUD_H = 54;
+import { W, H, TOWERS, TOWER_ORDER, towerStats, upgradeCost, sellValue, EMBER_MAX } from './config.js';
+import { PATH, PLOTS, EMBER } from './level.js';
+import { panelRect, upgradePanelRect } from './game.js';
 
-/** Deterministic specks from an index (no per-frame randomness). */
 function hash(n) {
-  const x = Math.sin(n * 127.1 + 311.7) * 43758.5453;
-  return x - Math.floor(x);
+  let x = (n * 2654435761) >>> 0;
+  x ^= x >>> 13;
+  x = Math.imul(x, 0x5bd1e995);
+  x ^= x >>> 15;
+  return (x >>> 0) / 4294967296;
 }
 
-function roundRect(ctx, x, y, w, h, r) {
+function rr(ctx, x, y, w, h, r) {
   ctx.beginPath();
   ctx.moveTo(x + r, y);
   ctx.arcTo(x + w, y, x + w, y + h, r);
@@ -26,694 +23,631 @@ function roundRect(ctx, x, y, w, h, r) {
   ctx.closePath();
 }
 
-function panelRectFor(plot) {
-  const w = 620;
-  const h = 138;
-  const x = Math.max(8, Math.min(FIELD.width - w - 8, plot.x - w / 2));
-  const y = plot.y > 380
-    ? Math.max(HUD_H + 8, plot.y - h - 78)
-    : Math.min(FIELD.height - h - 8, plot.y + 78);
-  return { x, y, w, h };
+function drawFlame(ctx, x, y, s, t, color) {
+  ctx.save();
+  ctx.translate(x, y);
+  const flick = Math.sin(t * 0.006 + x) * 0.12 + Math.sin(t * 0.011) * 0.08;
+  ctx.fillStyle = color;
+  ctx.beginPath();
+  ctx.moveTo(0, -26 * s);
+  ctx.bezierCurveTo(14 * s, -10 * s, 12 * s, 6 * s, 0, 12 * s);
+  ctx.bezierCurveTo(-12 * s, 6 * s, -14 * s, -10 * s, 0, -26 * s);
+  ctx.fill();
+  ctx.fillStyle = '#fff3c4';
+  ctx.beginPath();
+  ctx.moveTo(0, -14 * s * (1 + flick));
+  ctx.bezierCurveTo(7 * s, -4 * s, 6 * s, 6 * s, 0, 9 * s);
+  ctx.bezierCurveTo(-6 * s, 6 * s, -7 * s, -4 * s, 0, -14 * s * (1 + flick));
+  ctx.fill();
+  ctx.restore();
 }
 
-export function createRenderer(canvas) {
-  const ctx = canvas.getContext('2d');
-  let scale = 1;
-  let offsetX = 0;
-  let offsetY = 0;
+export function render(ctx, game, now) {
+  const s = game.state;
+  const t = now || 0;
+  ctx.clearRect(0, 0, W, H);
 
-  function fit(input) {
-    const rect = canvas.getBoundingClientRect();
-    const dpr = Math.min(2, window.devicePixelRatio || 1);
-    canvas.width = Math.max(1, Math.round(rect.width * dpr));
-    canvas.height = Math.max(1, Math.round(rect.height * dpr));
-    scale = Math.min(canvas.width / FIELD.width, canvas.height / FIELD.height);
-    offsetX = (canvas.width - FIELD.width * scale) / 2;
-    offsetY = (canvas.height - FIELD.height * scale) / 2;
-    if (input) input.setTransform(scale / dpr, offsetX / dpr, offsetY / dpr);
+  // Night forest background.
+  const bg = ctx.createLinearGradient(0, 0, 0, H);
+  bg.addColorStop(0, '#0d1f2d');
+  bg.addColorStop(0.55, '#12291f');
+  bg.addColorStop(1, '#0a1a14');
+  ctx.fillStyle = bg;
+  ctx.fillRect(0, 0, W, H);
+
+  // Stars (deterministic positions).
+  ctx.fillStyle = '#cfe8ff';
+  for (let i = 0; i < 70; i += 1) {
+    const x = hash(i * 3 + 1) * W;
+    const y = hash(i * 3 + 2) * 190;
+    const a = 0.25 + 0.55 * Math.abs(Math.sin(t * 0.001 + i));
+    ctx.globalAlpha = a * 0.8;
+    ctx.fillRect(x, y, 2, 2);
+  }
+  ctx.globalAlpha = 1;
+
+  // Pine trees (fixed spots, kept off the road).
+  const trees = [
+    [60, 60], [140, 90], [420, 80], [640, 90], [760, 80], [1080, 60],
+    [60, 300], [90, 480], [150, 620], [420, 640], [980, 640], [1150, 480],
+    [1140, 640], [60, 620], [330, 120], [700, 180], [880, 90], [1080, 480],
+  ];
+  for (const [x, y] of trees) {
+    ctx.fillStyle = '#123524';
+    ctx.beginPath();
+    ctx.moveTo(x, y - 34);
+    ctx.lineTo(x - 18, y + 8);
+    ctx.lineTo(x + 18, y + 8);
+    ctx.closePath();
+    ctx.fill();
+    ctx.fillStyle = '#0b2418';
+    ctx.fillRect(x - 2, y + 8, 4, 10);
   }
 
-  function drawBackground(state) {
-    const g = ctx.createLinearGradient(0, 0, 0, FIELD.height);
-    g.addColorStop(0, PALETTE.skyTop);
-    g.addColorStop(0.55, PALETTE.skyBottom);
-    g.addColorStop(0.551, PALETTE.ground);
-    g.addColorStop(1, PALETTE.groundDark);
-    ctx.fillStyle = g;
-    ctx.fillRect(0, 0, FIELD.width, FIELD.height);
+  drawRoad(ctx);
+  drawPlots(ctx, s, t);
+  drawEmber(ctx, s, t);
+  drawTowers(ctx, s, t);
+  drawEnemies(ctx, s, t);
+  drawProjectiles(ctx, s);
+  drawFx(ctx, s);
 
-    // Stars and a moon, fixed by index so the sky never shimmers.
-    ctx.fillStyle = '#e8ecff';
-    for (let i = 0; i < 90; i += 1) {
-      const x = hash(i) * FIELD.width;
-      const y = hash(i + 500) * 300;
-      const r = 0.6 + hash(i + 900) * 1.4;
-      ctx.globalAlpha = 0.35 + hash(i + 1300) * 0.55;
-      ctx.beginPath();
-      ctx.arc(x, y, r, 0, Math.PI * 2);
-      ctx.fill();
-    }
-    ctx.globalAlpha = 1;
-    ctx.fillStyle = '#f5edd0';
-    ctx.beginPath();
-    ctx.arc(1120, 105, 30, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.fillStyle = PALETTE.skyTop;
-    ctx.beginPath();
-    ctx.arc(1108, 97, 26, 0, Math.PI * 2);
-    ctx.fill();
-
-    // Distant pines along the top.
-    ctx.fillStyle = '#141d1a';
-    for (let x = 0; x < FIELD.width; x += 46) {
-      const h = 26 + hash(x) * 26;
-      ctx.beginPath();
-      ctx.moveTo(x, 396);
-      ctx.lineTo(x + 14, 396 - h);
-      ctx.lineTo(x + 28, 396);
-      ctx.closePath();
-      ctx.fill();
-    }
-
-    // Grass tufts.
-    ctx.strokeStyle = '#2c4a34';
-    ctx.lineWidth = 2;
-    for (let i = 0; i < 160; i += 1) {
-      const x = hash(i + 2000) * FIELD.width;
-      const y = 410 + hash(i + 2600) * 300;
-      ctx.beginPath();
-      ctx.moveTo(x, y);
-      ctx.lineTo(x + 3, y - 7);
-      ctx.moveTo(x + 5, y);
-      ctx.lineTo(x + 8, y - 6);
-      ctx.stroke();
+  if (s.screen === 'title') drawTitle(ctx, s, t);
+  else if (s.screen === 'victory') drawEnd(ctx, s, true);
+  else if (s.screen === 'defeat') drawEnd(ctx, s, false);
+  else {
+    drawHud(ctx, s);
+    drawPanels(ctx, s);
+    if (s.paused) {
+      ctx.fillStyle = 'rgba(4,10,16,0.6)';
+      ctx.fillRect(0, 0, W, H);
+      ctx.fillStyle = '#ffe9a8';
+      ctx.font = 'bold 54px Georgia, serif';
+      ctx.textAlign = 'center';
+      ctx.fillText('PAUSED', W / 2, H / 2 - 10);
+      ctx.font = '20px Georgia, serif';
+      ctx.fillStyle = '#dfe9e2';
+      ctx.fillText('Press P to resume the watch', W / 2, H / 2 + 30);
     }
   }
+}
 
-  function drawPath() {
-    ctx.lineJoin = 'round';
-    ctx.lineCap = 'round';
-    ctx.strokeStyle = PALETTE.pathEdge;
-    ctx.lineWidth = 68;
-    ctx.beginPath();
-    PATH.forEach((p, i) => (i === 0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y)));
-    ctx.stroke();
-    ctx.strokeStyle = PALETTE.path;
-    ctx.lineWidth = 58;
-    ctx.stroke();
-    // Cobbles, fixed along the path.
-    ctx.fillStyle = PALETTE.pathStone;
-    for (let d = 20; d < 2400; d += 46) {
-      const t = d / 2400;
-      const i = Math.min(PATH.length - 2, Math.floor(t * (PATH.length - 1)));
-      const a = PATH[i];
-      const b = PATH[i + 1];
-      const local = (t * (PATH.length - 1)) - i;
-      const x = a.x + (b.x - a.x) * local + (hash(d) - 0.5) * 36;
-      const y = a.y + (b.y - a.y) * local + (hash(d + 7) - 0.5) * 36;
-      ctx.globalAlpha = 0.5;
-      ctx.beginPath();
-      ctx.ellipse(x, y, 9, 6, hash(d + 13) * 3, 0, Math.PI * 2);
-      ctx.fill();
-    }
-    ctx.globalAlpha = 1;
-  }
+function drawRoad(ctx) {
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  ctx.strokeStyle = '#3a2f22';
+  ctx.lineWidth = 46;
+  ctx.beginPath();
+  ctx.moveTo(PATH[0].x, PATH[0].y);
+  for (let i = 1; i < PATH.length; i += 1) ctx.lineTo(PATH[i].x, PATH[i].y);
+  ctx.stroke();
+  ctx.strokeStyle = '#6b5636';
+  ctx.lineWidth = 38;
+  ctx.stroke();
+  ctx.strokeStyle = '#8a6f47';
+  ctx.lineWidth = 2;
+  ctx.setLineDash([14, 18]);
+  ctx.beginPath();
+  ctx.moveTo(PATH[0].x, PATH[0].y);
+  for (let i = 1; i < PATH.length; i += 1) ctx.lineTo(PATH[i].x, PATH[i].y);
+  ctx.stroke();
+  ctx.setLineDash([]);
+}
 
-  function drawPlots(state) {
-    for (const plot of PLOTS) {
-      const taken = state.towers.some((t) => t.plotId === plot.id);
-      const hovered = state.hoverPlot === plot.id || state.selectedPlot === plot.id;
-      ctx.beginPath();
-      ctx.arc(plot.x, plot.y, 30, 0, Math.PI * 2);
-      ctx.fillStyle = hovered ? PALETTE.plotHover : PALETTE.plot;
-      ctx.fill();
-      ctx.lineWidth = 3;
-      ctx.strokeStyle = state.selectedPlot === plot.id ? PALETTE.gold : PALETTE.plotEdge;
-      ctx.stroke();
-      if (!taken) {
-        ctx.strokeStyle = '#5f7a9e';
-        ctx.lineWidth = 2;
-        ctx.beginPath();
-        ctx.moveTo(plot.x - 8, plot.y);
-        ctx.lineTo(plot.x + 8, plot.y);
-        ctx.moveTo(plot.x, plot.y - 8);
-        ctx.lineTo(plot.x, plot.y + 8);
-        ctx.stroke();
-      }
-    }
-  }
-
-  function drawEmber(state) {
-    const flicker = 1 + Math.sin(state.time * 7) * 0.08 + Math.sin(state.time * 13) * 0.05;
-    const glow = ctx.createRadialGradient(EMBER.x, EMBER.y, 4, EMBER.x, EMBER.y, 110 * flicker);
-    glow.addColorStop(0, 'rgba(255,179,71,0.55)');
-    glow.addColorStop(1, 'rgba(255,179,71,0)');
-    ctx.fillStyle = glow;
-    ctx.fillRect(EMBER.x - 120, EMBER.y - 120, 240, 240);
-
-    // Stone keep.
-    ctx.fillStyle = '#3a4152';
-    roundRect(ctx, EMBER.x - 26, EMBER.y - 8, 52, 66, 6);
-    ctx.fill();
-    ctx.fillStyle = '#2b3242';
-    roundRect(ctx, EMBER.x - 32, EMBER.y - 16, 64, 16, 5);
-    ctx.fill();
-    // The lantern and its flame.
-    ctx.fillStyle = '#1c2230';
-    roundRect(ctx, EMBER.x - 16, EMBER.y - 52, 32, 40, 6);
-    ctx.fill();
-    ctx.fillStyle = PALETTE.emberCore;
-    ctx.beginPath();
-    ctx.ellipse(EMBER.x, EMBER.y - 32, 8 * flicker, 13 * flicker, 0, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.fillStyle = PALETTE.ember;
-    ctx.beginPath();
-    ctx.ellipse(EMBER.x, EMBER.y - 30, 4.5 * flicker, 8 * flicker, 0, 0, Math.PI * 2);
-    ctx.fill();
-    // Health ring.
-    ctx.lineWidth = 5;
-    ctx.strokeStyle = '#20263a';
-    ctx.beginPath();
-    ctx.arc(EMBER.x, EMBER.y - 32, 30, 0, Math.PI * 2);
-    ctx.stroke();
-    ctx.strokeStyle = state.emberHp <= 5 ? PALETTE.danger : PALETTE.ember;
-    ctx.beginPath();
-    ctx.arc(EMBER.x, EMBER.y - 32, 30, -Math.PI / 2, -Math.PI / 2 + (Math.PI * 2 * state.emberHp) / EMBER.hp);
-    ctx.stroke();
-  }
-
-  function drawTower(tower, state) {
-    const def = TOWERS[tower.kind];
-    // Base.
-    ctx.fillStyle = '#39445a';
-    ctx.beginPath();
-    ctx.arc(tower.x, tower.y, 26, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.lineWidth = 3;
-    ctx.strokeStyle = '#4a5468';
-    ctx.stroke();
-    const flash = tower.flash > 0 ? tower.flash : 0;
-    if (tower.kind === 'spark') {
-      ctx.save();
-      ctx.translate(tower.x, tower.y - 10);
-      ctx.rotate(Math.PI / 4);
-      ctx.fillStyle = flash > 0 ? '#fff3c4' : def.color;
-      ctx.fillRect(-11, -11, 22, 22);
-      ctx.restore();
-    } else if (tower.kind === 'frost') {
-      ctx.fillStyle = flash > 0 ? '#e6f7ff' : def.color;
-      ctx.beginPath();
-      ctx.arc(tower.x, tower.y - 10, 13, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.strokeStyle = '#ffffff';
-      ctx.lineWidth = 2;
-      for (let i = 0; i < 3; i += 1) {
-        const a = (i * Math.PI) / 3;
-        ctx.beginPath();
-        ctx.moveTo(tower.x - Math.cos(a) * 9, tower.y - 10 - Math.sin(a) * 9);
-        ctx.lineTo(tower.x + Math.cos(a) * 9, tower.y - 10 + Math.sin(a) * 9);
-        ctx.stroke();
-      }
-    } else if (tower.kind === 'cannon') {
-      ctx.save();
-      ctx.translate(tower.x, tower.y - 8);
-      ctx.rotate(tower.angle);
-      ctx.fillStyle = '#2b3242';
-      roundRect(ctx, -6, -7, 30, 14, 5);
-      ctx.fill();
-      ctx.fillStyle = flash > 0 ? '#ffd9a0' : def.color;
-      ctx.beginPath();
-      ctx.arc(24, 0, 7, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.restore();
-      ctx.fillStyle = def.dark;
-      ctx.beginPath();
-      ctx.arc(tower.x, tower.y - 8, 10, 0, Math.PI * 2);
-      ctx.fill();
-    } else {
-      ctx.save();
-      ctx.translate(tower.x, tower.y - 8);
-      ctx.rotate(Math.sin(state.time * 1.5) * 0.12);
-      ctx.fillStyle = flash > 0 ? '#f3e8ff' : def.color;
-      ctx.beginPath();
-      ctx.moveTo(0, -24);
-      ctx.lineTo(12, 6);
-      ctx.lineTo(-12, 6);
-      ctx.closePath();
-      ctx.fill();
-      ctx.restore();
-      ctx.strokeStyle = def.color;
-      ctx.lineWidth = 2;
-      ctx.beginPath();
-      ctx.arc(tower.x, tower.y - 8, 19, state.time * 0.8, state.time * 0.8 + Math.PI * 1.2);
-      ctx.stroke();
-    }
-    // Level pips.
-    for (let i = 0; i < MAX_LEVEL; i += 1) {
-      ctx.fillStyle = i < tower.level ? PALETTE.gold : '#4a5468';
-      ctx.beginPath();
-      ctx.arc(tower.x - 12 + i * 12, tower.y + 20, 3.5, 0, Math.PI * 2);
-      ctx.fill();
-    }
-  }
-
-  function drawEnemy(enemy, state) {
-    const hpFrac = enemy.hp / enemy.maxHp;
+function drawPlots(ctx, s, t) {
+  for (const plot of PLOTS) {
+    const occupied = s.towers.some((tw) => tw.plotId === plot.id);
+    const selected = s.selectedPlot === plot.id;
     ctx.save();
-    ctx.translate(enemy.x, enemy.y);
-    if (enemy.kind === 'wisp') {
-      const glow = ctx.createRadialGradient(0, 0, 2, 0, 0, 26);
-      glow.addColorStop(0, enemy.color);
-      glow.addColorStop(1, 'rgba(154,167,255,0)');
-      ctx.fillStyle = glow;
+    ctx.translate(plot.x, plot.y);
+    if (selected) {
+      ctx.strokeStyle = '#ffe9a8';
+      ctx.lineWidth = 3;
       ctx.beginPath();
-      ctx.arc(0, 0, 26, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.fillStyle = '#e8ecff';
+      ctx.arc(0, 0, 34 + Math.sin(t * 0.005) * 2, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+    ctx.fillStyle = occupied ? '#2c2620' : '#4a4238';
+    ctx.beginPath();
+    ctx.arc(0, 0, 28, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = '#8a7a5f';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    if (!occupied) {
+      ctx.fillStyle = '#c9b489';
+      ctx.font = 'bold 13px Georgia, serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText('✦', 0, -1);
+      ctx.fillStyle = '#ffe9a8';
+      ctx.font = '11px Georgia, serif';
+      ctx.fillText('★'.repeat(Math.max(1, Math.round(plot.value / 20))), 0, 16);
+    }
+    ctx.restore();
+  }
+}
+
+function drawEmber(ctx, s, t) {
+  const { x, y } = EMBER;
+  const glow = ctx.createRadialGradient(x, y, 4, x, y, 90);
+  const intensity = s.emberHp / EMBER_MAX;
+  glow.addColorStop(0, `rgba(255,190,80,${0.35 + 0.45 * intensity})`);
+  glow.addColorStop(1, 'rgba(255,190,80,0)');
+  ctx.fillStyle = glow;
+  ctx.fillRect(x - 90, y - 90, 180, 180);
+  // Stone keep.
+  ctx.fillStyle = '#5a5148';
+  rr(ctx, x - 26, y - 18, 52, 44, 8);
+  ctx.fill();
+  ctx.fillStyle = '#3a332c';
+  ctx.fillRect(x - 26, y - 18, 52, 10);
+  ctx.fillStyle = '#7a6f60';
+  ctx.fillRect(x - 20, y + 8, 40, 6);
+  // The ember flame.
+  drawFlame(ctx, x, y - 16, 1 + 0.15 * Math.sin(t * 0.004), t, '#ff9a2a');
+  // Hearts.
+  ctx.font = 'bold 15px Georgia, serif';
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#ffb3b3';
+  ctx.fillText(`♥ ${s.emberHp}/${EMBER_MAX}`, x, y + 52);
+}
+
+function drawTowers(ctx, s, t) {
+  for (const tw of s.towers) {
+    const stats = towerStats(tw.kind, tw.level);
+    const selected = s.selectedTower === tw.id;
+    ctx.save();
+    ctx.translate(tw.x, tw.y);
+    // Range ring when selected.
+    if (selected) {
+      ctx.strokeStyle = 'rgba(255,233,168,0.7)';
+      ctx.lineWidth = 2;
+      ctx.setLineDash([6, 6]);
       ctx.beginPath();
-      ctx.arc(0, 0, 7, 0, Math.PI * 2);
-      ctx.fill();
-    } else if (enemy.kind === 'crawler') {
-      ctx.fillStyle = enemy.dark;
-      for (let i = 0; i < 6; i += 1) {
-        const a = (i / 6) * Math.PI * 2 + state.time * 2;
-        ctx.beginPath();
-        ctx.arc(Math.cos(a) * 14, Math.sin(a) * 10, 3, 0, Math.PI * 2);
-        ctx.fill();
-      }
-      ctx.fillStyle = enemy.color;
+      ctx.arc(0, 0, stats.range, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+    // Base.
+    ctx.fillStyle = '#4a4238';
+    ctx.beginPath();
+    ctx.arc(0, 0, 24, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = '#8a7a5f';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    ctx.rotate(tw.angle + Math.PI / 2);
+    ctx.fillStyle = stats.color;
+    if (tw.kind === 'spark') {
       ctx.beginPath();
-      ctx.ellipse(0, 0, 15, 11, 0, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.fillStyle = '#12210f';
-      ctx.beginPath();
-      ctx.arc(6, -3, 2, 0, Math.PI * 2);
-      ctx.arc(10, -3, 2, 0, Math.PI * 2);
-      ctx.fill();
-    } else if (enemy.kind === 'flutter') {
-      const flap = Math.sin(state.time * 14 + enemy.wobble) * 0.5;
-      ctx.fillStyle = 'rgba(255,179,217,0.75)';
-      ctx.save();
-      ctx.rotate(-0.5 - flap);
-      ctx.beginPath();
-      ctx.ellipse(-8, -8, 12, 6, 0, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.restore();
-      ctx.save();
-      ctx.rotate(0.5 + flap);
-      ctx.beginPath();
-      ctx.ellipse(8, -8, 12, 6, 0, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.restore();
-      ctx.fillStyle = enemy.color;
-      ctx.beginPath();
-      ctx.ellipse(0, 0, 9, 12, 0, 0, Math.PI * 2);
-      ctx.fill();
-    } else if (enemy.kind === 'brute') {
-      ctx.fillStyle = enemy.dark;
-      for (let i = 0; i < 8; i += 1) {
-        const a = (i / 8) * Math.PI * 2;
-        ctx.beginPath();
-        ctx.moveTo(Math.cos(a) * 14, Math.sin(a) * 14);
-        ctx.lineTo(Math.cos(a) * 24, Math.sin(a) * 24);
-        ctx.lineTo(Math.cos(a + 0.35) * 14, Math.sin(a + 0.35) * 14);
-        ctx.closePath();
-        ctx.fill();
-      }
-      ctx.fillStyle = enemy.color;
-      ctx.beginPath();
-      ctx.arc(0, 0, 17, 0, Math.PI * 2);
+      ctx.moveTo(0, -26);
+      ctx.lineTo(9, 6);
+      ctx.lineTo(-9, 6);
+      ctx.closePath();
       ctx.fill();
       ctx.fillStyle = '#fff3c4';
       ctx.beginPath();
-      ctx.arc(-5, -4, 3, 0, Math.PI * 2);
-      ctx.arc(6, -4, 3, 0, Math.PI * 2);
+      ctx.arc(0, -4, 5, 0, Math.PI * 2);
+      ctx.fill();
+    } else if (tw.kind === 'frost') {
+      ctx.beginPath();
+      ctx.arc(0, -8, 12, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = '#eafcff';
+      ctx.beginPath();
+      ctx.arc(0, -8, 5, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.strokeStyle = stats.color;
+      ctx.lineWidth = 3;
+      for (let k = 0; k < 3; k += 1) {
+        const a = (k * Math.PI * 2) / 3 + 0.5;
+        ctx.beginPath();
+        ctx.moveTo(Math.cos(a) * 12, -8 + Math.sin(a) * 12);
+        ctx.lineTo(Math.cos(a) * 20, -8 + Math.sin(a) * 20);
+        ctx.stroke();
+      }
+    } else if (tw.kind === 'cannon') {
+      ctx.fillRect(-7, -30, 14, 30);
+      ctx.beginPath();
+      ctx.arc(0, -28, 9, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = '#2c1c10';
+      ctx.beginPath();
+      ctx.arc(0, -30, 5, 0, Math.PI * 2);
       ctx.fill();
     } else {
-      const glow = ctx.createRadialGradient(0, 0, 4, 0, 0, 52);
-      glow.addColorStop(0, 'rgba(232,121,249,0.5)');
-      glow.addColorStop(1, 'rgba(232,121,249,0)');
-      ctx.fillStyle = glow;
+      // Prism: rotating crystal.
+      ctx.rotate(Math.sin(t * 0.002 + tw.id) * 0.15);
       ctx.beginPath();
-      ctx.arc(0, 0, 52, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.fillStyle = enemy.color;
-      ctx.beginPath();
-      ctx.arc(0, 0, 25, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.fillStyle = PALETTE.gold;
-      ctx.beginPath();
-      ctx.moveTo(-14, -22);
-      ctx.lineTo(-7, -34);
-      ctx.lineTo(0, -24);
-      ctx.lineTo(7, -34);
-      ctx.lineTo(14, -22);
-      ctx.lineTo(0, -27);
+      ctx.moveTo(0, -28);
+      ctx.lineTo(11, 0);
+      ctx.lineTo(0, 10);
+      ctx.lineTo(-11, 0);
       ctx.closePath();
       ctx.fill();
-      ctx.fillStyle = '#2b0a33';
+      ctx.fillStyle = 'rgba(255,255,255,0.85)';
       ctx.beginPath();
-      ctx.arc(-8, -2, 3.5, 0, Math.PI * 2);
-      ctx.arc(8, -2, 3.5, 0, Math.PI * 2);
+      ctx.moveTo(0, -20);
+      ctx.lineTo(5, -2);
+      ctx.lineTo(0, 4);
+      ctx.lineTo(-5, -2);
+      ctx.closePath();
       ctx.fill();
     }
     ctx.restore();
-    if (hpFrac < 1) {
-      ctx.fillStyle = '#20263a';
-      ctx.fillRect(enemy.x - 16, enemy.y - enemy.radius - 12, 32, 5);
-      ctx.fillStyle = hpFrac > 0.5 ? PALETTE.ok : PALETTE.danger;
-      ctx.fillRect(enemy.x - 16, enemy.y - enemy.radius - 12, 32 * hpFrac, 5);
+    // Level pips.
+    ctx.fillStyle = '#ffe9a8';
+    for (let i = 0; i < tw.level; i += 1) {
+      ctx.beginPath();
+      ctx.arc(tw.x - 10 + i * 10, tw.y + 28, 3.5, 0, Math.PI * 2);
+      ctx.fill();
     }
   }
+}
 
-  function drawProjectiles(state) {
-    for (const shell of state.projectiles) {
+function drawEnemies(ctx, s, t) {
+  for (const e of s.enemies) {
+    const slowed = t < 0 ? false : s.time < e.slowUntil;
+    ctx.save();
+    ctx.translate(e.x, e.y);
+    // Shadow.
+    ctx.fillStyle = 'rgba(0,0,0,0.35)';
+    ctx.beginPath();
+    ctx.ellipse(0, e.radius * 0.8, e.radius, e.radius * 0.4, 0, 0, Math.PI * 2);
+    ctx.fill();
+    if (slowed) {
+      ctx.strokeStyle = '#7fd4ff';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(0, 0, e.radius + 4, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+    ctx.fillStyle = e.flash > 0 ? '#ffffff' : e.color;
+    const wob = Math.sin(t * 0.008 + e.id * 1.7) * 2;
+    if (e.shape === 'blob') {
+      ctx.beginPath();
+      ctx.arc(0, wob * 0.4, e.radius, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = '#241a3d';
+      ctx.beginPath();
+      ctx.arc(-4, -3, 2.5, 0, Math.PI * 2);
+      ctx.arc(4, -3, 2.5, 0, Math.PI * 2);
+      ctx.fill();
+    } else if (e.shape === 'dart') {
+      ctx.beginPath();
+      ctx.moveTo(e.radius + 4, 0);
+      ctx.lineTo(-e.radius, -e.radius * 0.8);
+      ctx.lineTo(-e.radius * 0.4, 0);
+      ctx.lineTo(-e.radius, e.radius * 0.8);
+      ctx.closePath();
+      ctx.fill();
+    } else if (e.shape === 'brute') {
+      rr(ctx, -e.radius, -e.radius + wob * 0.3, e.radius * 2, e.radius * 2, 6);
+      ctx.fill();
+      ctx.fillStyle = '#1d2f24';
+      ctx.fillRect(-e.radius + 3, -6, e.radius * 2 - 6, 4);
+      ctx.beginPath();
+      ctx.arc(-5, -4, 2, 0, Math.PI * 2);
+      ctx.arc(5, -4, 2, 0, Math.PI * 2);
+      ctx.fill();
+    } else if (e.shape === 'wisp') {
+      ctx.globalAlpha = 0.9;
+      ctx.beginPath();
+      ctx.arc(0, wob * 0.5, e.radius, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = '#fffbe0';
+      ctx.beginPath();
+      ctx.arc(0, wob * 0.5, 3, 0, Math.PI * 2);
+      ctx.fill();
+    } else {
+      // Gloomlord: crowned shadow.
+      ctx.beginPath();
+      ctx.arc(0, 0, e.radius, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = '#8a5cff';
+      ctx.beginPath();
+      ctx.moveTo(-16, -e.radius + 4);
+      ctx.lineTo(-10, -e.radius - 12);
+      ctx.lineTo(-4, -e.radius + 2);
+      ctx.lineTo(2, -e.radius - 12);
+      ctx.lineTo(8, -e.radius + 2);
+      ctx.lineTo(14, -e.radius - 10);
+      ctx.lineTo(16, -e.radius + 4);
+      ctx.closePath();
+      ctx.fill();
+      ctx.fillStyle = '#ff5c5c';
+      ctx.beginPath();
+      ctx.arc(-7, -2, 3, 0, Math.PI * 2);
+      ctx.arc(7, -2, 3, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.restore();
+    // HP bar.
+    if (e.hp < e.maxHp) {
+      const w = e.radius * 2;
+      ctx.fillStyle = 'rgba(0,0,0,0.6)';
+      ctx.fillRect(e.x - w / 2, e.y - e.radius - 10, w, 4);
+      ctx.fillStyle = '#7dff8a';
+      ctx.fillRect(e.x - w / 2, e.y - e.radius - 10, w * Math.max(0, e.hp / e.maxHp), 4);
+    }
+  }
+}
+
+function drawProjectiles(ctx, s) {
+  for (const p of s.projectiles) {
+    ctx.save();
+    if (p.kind === 'cannon') {
+      ctx.fillStyle = '#ff7a4d';
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, 6, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = '#ffd27f';
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, 3, 0, Math.PI * 2);
+      ctx.fill();
+    } else if (p.kind === 'frost') {
+      ctx.fillStyle = '#7fd4ff';
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, 5, 0, Math.PI * 2);
+      ctx.fill();
+    } else {
       ctx.fillStyle = '#ffb347';
       ctx.beginPath();
-      ctx.arc(shell.x, shell.y, 5, 0, Math.PI * 2);
+      ctx.arc(p.x, p.y, 4, 0, Math.PI * 2);
       ctx.fill();
       ctx.fillStyle = '#fff3c4';
       ctx.beginPath();
-      ctx.arc(shell.x, shell.y, 2.5, 0, Math.PI * 2);
+      ctx.arc(p.x, p.y, 2, 0, Math.PI * 2);
       ctx.fill();
     }
+    ctx.restore();
   }
+}
 
-  function drawParticles(particles) {
-    for (const beam of particles.beams) {
-      ctx.globalAlpha = Math.max(0, beam.life / 0.16);
-      ctx.strokeStyle = beam.color;
+function drawFx(ctx, s) {
+  for (const f of s.fx) {
+    const a = Math.max(0, f.ttl / f.max);
+    if (f.kind === 'burst') {
+      ctx.fillStyle = f.color;
+      ctx.globalAlpha = a;
+      ctx.beginPath();
+      ctx.arc(f.x, f.y, 4 + (1 - a) * 14, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.globalAlpha = 1;
+    } else if (f.kind === 'ring') {
+      ctx.strokeStyle = f.color;
+      ctx.globalAlpha = a;
       ctx.lineWidth = 3;
       ctx.beginPath();
-      ctx.moveTo(beam.x1, beam.y1);
-      ctx.lineTo(beam.x2, beam.y2);
+      ctx.arc(f.x, f.y, f.r * (1 - a * 0.6), 0, Math.PI * 2);
       ctx.stroke();
+      ctx.globalAlpha = 1;
+    } else if (f.kind === 'beam') {
+      ctx.strokeStyle = f.color;
+      ctx.globalAlpha = a;
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.moveTo(f.x1, f.y1);
+      ctx.lineTo(f.x2, f.y2);
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+    } else if (f.kind === 'leak') {
+      ctx.fillStyle = '#ff5c5c';
+      ctx.globalAlpha = a;
+      ctx.font = 'bold 18px Georgia, serif';
+      ctx.textAlign = 'center';
+      ctx.fillText('−♥', f.x, f.y - (1 - a) * 24);
+      ctx.globalAlpha = 1;
     }
-    ctx.globalAlpha = 1;
-    for (const p of particles.sparks) {
-      ctx.globalAlpha = Math.max(0, p.life / p.max);
-      if (p.ring) {
-        ctx.strokeStyle = p.color;
-        ctx.lineWidth = 3;
-        ctx.beginPath();
-        ctx.arc(p.x, p.y, p.size * (1 - p.life / p.max) + 6, 0, Math.PI * 2);
-        ctx.stroke();
-      } else {
-        ctx.fillStyle = p.color;
-        ctx.beginPath();
-        ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
-        ctx.fill();
-      }
-    }
-    ctx.globalAlpha = 1;
-    ctx.font = `bold 15px ${FONT}`;
+  }
+}
+
+function drawHud(ctx, s) {
+  ctx.fillStyle = 'rgba(6,14,20,0.82)';
+  ctx.fillRect(0, 0, W, 52);
+  ctx.fillStyle = '#ffe9a8';
+  ctx.font = 'bold 20px Georgia, serif';
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('🔥 Emberlight Keep', 16, 26);
+  ctx.fillStyle = '#dfe9e2';
+  ctx.font = '17px Georgia, serif';
+  ctx.fillText(`Gold ${s.gold}g`, 260, 26);
+  ctx.fillText(`Wave ${s.wave}/${10}`, 400, 26);
+  ctx.fillText(`Score ${s.score}`, 520, 26);
+  ctx.fillStyle = s.emberHp <= 5 ? '#ff8a8a' : '#ffb3b3';
+  ctx.fillText(`♥ Ember ${s.emberHp}/${EMBER_MAX}`, 660, 26);
+  ctx.fillText(`Kills ${s.kills}`, 850, 26);
+  // Buttons.
+  const btn = (x, label, active) => {
+    ctx.fillStyle = active ? '#7a5a1e' : '#2c3a2e';
+    rr(ctx, x, 8, 120, 36, 8);
+    ctx.fill();
+    ctx.strokeStyle = '#ffe9a8';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+    ctx.fillStyle = '#ffe9a8';
+    ctx.font = 'bold 15px Georgia, serif';
     ctx.textAlign = 'center';
-    for (const f of particles.floats) {
-      ctx.globalAlpha = Math.min(1, f.life);
-      ctx.fillStyle = f.color;
-      ctx.fillText(f.text, f.x, f.y);
-    }
-    ctx.globalAlpha = 1;
-  }
+    ctx.fillText(label, x + 60, 27);
+  };
+  // Call-wave button is 120 wide at x=980; speed/pause/mute are 40-wide squares.
+  btn(980, s.phase === 'build' ? '▶ Call Wave' : '… Wave …', s.phase === 'build');
+  const sq = (x, label) => {
+    ctx.fillStyle = '#2c3a2e';
+    rr(ctx, x, 8, 40, 36, 8);
+    ctx.fill();
+    ctx.strokeStyle = '#ffe9a8';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+    ctx.fillStyle = '#ffe9a8';
+    ctx.font = 'bold 15px Georgia, serif';
+    ctx.textAlign = 'center';
+    ctx.fillText(label, x + 20, 27);
+  };
+  sq(1110, s.speed === 2 ? '2×' : '1×');
+  sq(1160, s.paused ? '▶' : '❚❚');
+  sq(1210, s.muted ? '✕' : '♪');
+  // Message line.
+  ctx.fillStyle = 'rgba(6,14,20,0.75)';
+  ctx.fillRect(0, H - 34, W, 34);
+  ctx.fillStyle = '#dfe9e2';
+  ctx.font = '15px Georgia, serif';
+  ctx.textAlign = 'left';
+  ctx.fillText(s.message, 16, H - 17);
+  ctx.textAlign = 'right';
+  ctx.fillStyle = '#9fb8a8';
+  ctx.fillText('Click a plot to build (1–4) · Space: call wave · P pause · F speed · M mute · R restart', W - 16, H - 17);
+}
 
-  function drawRange(state) {
-    const tower = state.towers.find((t) => t.id === state.selectedTower);
-    if (tower) {
-      ctx.fillStyle = 'rgba(255,209,102,0.08)';
-      ctx.strokeStyle = 'rgba(255,209,102,0.5)';
-      ctx.lineWidth = 2;
-      ctx.beginPath();
-      ctx.arc(tower.x, tower.y, tower.range, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.stroke();
-      return;
-    }
-    if (state.selectedPlot !== null && state.hoverKind) {
-      const plot = PLOTS[state.selectedPlot];
-      const stats = towerStats(state.hoverKind, 1);
-      ctx.fillStyle = 'rgba(255,209,102,0.08)';
-      ctx.strokeStyle = 'rgba(255,209,102,0.5)';
-      ctx.lineWidth = 2;
-      ctx.beginPath();
-      ctx.arc(plot.x, plot.y, stats.range, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.stroke();
-    }
-  }
-
-  function button(ctx2, rect, label, enabled = true) {
-    ctx2.fillStyle = enabled ? PALETTE.button : '#232a3a';
-    roundRect(ctx2, rect.x, rect.y, rect.w, rect.h, 8);
-    ctx2.fill();
-    ctx2.lineWidth = 2;
-    ctx2.strokeStyle = PALETTE.buttonEdge;
-    ctx2.stroke();
-    ctx2.fillStyle = enabled ? PALETTE.text : PALETTE.muted;
-    ctx2.font = `bold 16px ${FONT}`;
-    ctx2.textAlign = 'center';
-    ctx2.textBaseline = 'middle';
-    ctx2.fillText(label, rect.x + rect.w / 2, rect.y + rect.h / 2 + 1);
-    ctx2.textBaseline = 'alphabetic';
-  }
-
-  function drawHud(state, best) {
-    ctx.fillStyle = 'rgba(16,20,34,0.92)';
-    ctx.fillRect(0, 0, FIELD.width, HUD_H);
-    ctx.fillStyle = PALETTE.panelEdge;
-    ctx.fillRect(0, HUD_H, FIELD.width, 2);
+function drawPanels(ctx, s) {
+  if (s.selectedPlot) {
+    const panel = panelRect(s.selectedPlot);
+    if (!panel) return;
+    ctx.fillStyle = 'rgba(6,14,20,0.92)';
+    rr(ctx, panel.x, panel.y, panel.w, panel.h, 12);
+    ctx.fill();
+    ctx.strokeStyle = '#ffe9a8';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    ctx.fillStyle = '#ffe9a8';
+    ctx.font = 'bold 17px Georgia, serif';
     ctx.textAlign = 'left';
     ctx.textBaseline = 'middle';
-    ctx.font = `bold 20px ${FONT}`;
-    ctx.fillStyle = PALETTE.gold;
-    ctx.fillText(`⬢ ${state.gold}`, 18, HUD_H / 2 + 1);
-    ctx.fillStyle = PALETTE.text;
-    ctx.fillText(`Wave ${Math.max(1, state.wave)} / ${WAVE_COUNT}`, 150, HUD_H / 2 + 1);
-    // Ember hearts.
-    for (let i = 0; i < EMBER.hp; i += 1) {
-      ctx.fillStyle = i < state.emberHp ? PALETTE.heart : '#3a4152';
-      const x = 300 + i * 15;
-      ctx.beginPath();
-      ctx.arc(x, HUD_H / 2 - 2, 5.5, 0, Math.PI * 2);
+    ctx.fillText('Raise a tower  —  press 1–4 or click', panel.x + 16, panel.y + 22);
+    TOWER_ORDER.forEach((key, i) => {
+      const def = TOWERS[key];
+      const cx = panel.x + 16 + i * 152;
+      const cy = panel.y + 40;
+      const afford = s.gold >= def.cost;
+      ctx.fillStyle = afford ? '#2c3a2e' : '#3a2a2a';
+      rr(ctx, cx, cy, 144, 84, 10);
       ctx.fill();
-    }
-    ctx.fillStyle = PALETTE.text;
-    ctx.font = `16px ${FONT}`;
-    ctx.fillText(`Score ${state.score}   Kills ${state.kills}   Best ${Math.max(best, state.score)}`, 620, HUD_H / 2 + 1);
-    button(ctx, { x: 1060, y: 10, w: 58, h: 34 }, state.speed === 1 ? '1×' : '2×');
-    button(ctx, { x: 1126, y: 10, w: 58, h: 34 }, 'II');
-    button(ctx, { x: 1192, y: 10, w: 58, h: 34 }, '♪');
-    ctx.textBaseline = 'alphabetic';
-    if (state.phase === 'build' && state.screen === SCREEN_PLAY) {
-      const label = state.wave === 0
-        ? `Start wave 1  (Space) — ${Math.ceil(state.buildTime)}s`
-        : `Call wave ${state.wave + 1} early +${25}  (Space) — ${Math.ceil(state.buildTime)}s`;
-      ctx.font = `bold 17px ${FONT}`;
-      const w = ctx.measureText(label).width + 36;
-      button(ctx, { x: FIELD.width / 2 - w / 2, y: FIELD.height - 52, w, h: 38 }, label);
-    }
+      ctx.strokeStyle = def.color;
+      ctx.lineWidth = 2;
+      ctx.stroke();
+      ctx.fillStyle = def.color;
+      ctx.font = 'bold 14px Georgia, serif';
+      ctx.textAlign = 'center';
+      ctx.fillText(`${i + 1} · ${def.name}`, cx + 72, cy + 18);
+      ctx.fillStyle = '#dfe9e2';
+      ctx.font = '12px Georgia, serif';
+      ctx.fillText(`DMG ${def.damage} · ${def.rate.toFixed(1)}/s`, cx + 72, cy + 40);
+      ctx.fillText(def.key === 'frost' ? 'Slows 45%' : def.key === 'cannon' ? 'Splash 55' : def.key === 'prism' ? 'Chains ×3' : 'Fast bolts', cx + 72, cy + 58);
+      ctx.fillStyle = afford ? '#ffd27f' : '#ff8a8a';
+      ctx.font = 'bold 14px Georgia, serif';
+      ctx.fillText(`${def.cost}g`, cx + 72, cy + 76);
+    });
   }
-
-  function drawBuildPanel(state) {
-    const plot = PLOTS[state.selectedPlot];
-    if (!plot) return;
-    const tower = state.towers.find((t) => t.plotId === plot.id);
-    const rect = panelRectFor(plot);
-    ctx.fillStyle = PALETTE.panel;
-    roundRect(ctx, rect.x, rect.y, rect.w, rect.h, 12);
+  if (s.selectedTower) {
+    const tower = s.towers.find((tw) => tw.id === s.selectedTower);
+    if (!tower) return;
+    const panel = upgradePanelRect(tower);
+    const def = TOWERS[tower.kind];
+    const stats = towerStats(tower.kind, tower.level);
+    ctx.fillStyle = 'rgba(6,14,20,0.92)';
+    rr(ctx, panel.x, panel.y, panel.w, panel.h, 12);
     ctx.fill();
+    ctx.strokeStyle = '#ffe9a8';
     ctx.lineWidth = 2;
-    ctx.strokeStyle = PALETTE.panelEdge;
     ctx.stroke();
+    ctx.fillStyle = '#ffe9a8';
+    ctx.font = 'bold 17px Georgia, serif';
     ctx.textAlign = 'left';
-    ctx.fillStyle = PALETTE.text;
-    ctx.font = `bold 17px ${FONT}`;
-    if (!tower) {
-      ctx.fillText('Build a tower here — click a card, or press 1–4', rect.x + 16, rect.y + 26);
-      const cardW = (rect.w - 32 - 3 * 10) / 4;
-      TOWER_ORDER.forEach((kind, i) => {
-        const def = TOWERS[kind];
-        const card = { x: rect.x + 16 + i * (cardW + 10), y: rect.y + 40, w: cardW, h: 84 };
-        const afford = state.gold >= def.cost;
-        ctx.fillStyle = afford ? PALETTE.button : '#232a3a';
-        roundRect(ctx, card.x, card.y, card.w, card.h, 8);
-        ctx.fill();
-        ctx.strokeStyle = state.hoverKind === kind ? PALETTE.gold : PALETTE.buttonEdge;
-        ctx.lineWidth = state.hoverKind === kind ? 3 : 1.5;
-        ctx.stroke();
-        ctx.fillStyle = def.color;
-        ctx.beginPath();
-        ctx.arc(card.x + 18, card.y + 18, 7, 0, Math.PI * 2);
-        ctx.fill();
-        ctx.fillStyle = afford ? PALETTE.text : PALETTE.muted;
-        ctx.font = `bold 14px ${FONT}`;
-        ctx.fillText(`${def.short}  [${def.key}]`, card.x + 32, card.y + 22);
-        ctx.fillStyle = PALETTE.gold;
-        ctx.font = `13px ${FONT}`;
-        ctx.fillText(`⬢ ${def.cost}`, card.x + 10, card.y + 44);
-        ctx.fillStyle = PALETTE.muted;
-        ctx.font = `12px ${FONT}`;
-        ctx.fillText(`dmg ${def.damage} · ${def.rate}/s`, card.x + 10, card.y + 62);
-        ctx.fillText(`range ${def.range}`, card.x + 10, card.y + 78);
-      });
-    } else {
-      const def = TOWERS[tower.kind];
-      ctx.fillText(`${def.name} — level ${tower.level} / ${MAX_LEVEL}`, rect.x + 16, rect.y + 26);
-      ctx.fillStyle = PALETTE.muted;
-      ctx.font = `14px ${FONT}`;
-      ctx.fillText(`Damage ${tower.damage} · ${tower.rate} shots/s · range ${tower.range} · ${def.blurb}`, rect.x + 16, rect.y + 52);
-      const upCost = upgradeCost(tower);
-      const sell = sellValue(tower);
-      button(ctx, { x: rect.x + 16, y: rect.y + 72, w: 250, h: 44 }, upCost > 0 ? `Upgrade — ⬢ ${upCost}` : 'Fully upgraded', upCost > 0 && state.gold >= upCost);
-      button(ctx, { x: rect.x + 282, y: rect.y + 72, w: 180, h: 44 }, `Sell — ⬢ ${sell}`);
-      button(ctx, { x: rect.x + 478, y: rect.y + 72, w: 126, h: 44 }, 'Close');
-    }
-  }
-
-  function drawBanner(state) {
-    if (!state.banner) return;
-    ctx.textAlign = 'center';
-    ctx.fillStyle = 'rgba(16,20,34,0.72)';
-    const w = 560;
-    roundRect(ctx, FIELD.width / 2 - w / 2, 78, w, state.banner.sub ? 74 : 52, 12);
+    ctx.textBaseline = 'middle';
+    ctx.fillText(`${def.name} — Level ${tower.level} · ${tower.kills} kills · DMG ${stats.damage} · Range ${stats.range}`, panel.x + 16, panel.y + 22);
+    const upCost = tower.level < 3 ? upgradeCost(tower.kind, tower.level) : null;
+    ctx.fillStyle = upCost !== null && s.gold >= upCost ? '#2c3a2e' : '#3a2a2a';
+    rr(ctx, panel.x + 16, panel.y + 40, 200, 84, 10);
     ctx.fill();
-    ctx.fillStyle = PALETTE.text;
-    ctx.font = `bold 26px ${FONT}`;
-    ctx.fillText(state.banner.text, FIELD.width / 2, 108);
-    if (state.banner.sub) {
-      ctx.fillStyle = PALETTE.muted;
-      ctx.font = `15px ${FONT}`;
-      ctx.fillText(state.banner.sub, FIELD.width / 2, 134);
-    }
-    ctx.textAlign = 'left';
-  }
-
-  function overlay(title, lines, foot, accent) {
-    ctx.fillStyle = 'rgba(10,13,26,0.78)';
-    ctx.fillRect(0, 0, FIELD.width, FIELD.height);
-    const w = 680;
-    const h = 150 + lines.length * 30 + 74;
-    const x = FIELD.width / 2 - w / 2;
-    const y = FIELD.height / 2 - h / 2;
-    ctx.fillStyle = PALETTE.panelSolid;
-    roundRect(ctx, x, y, w, h, 16);
-    ctx.fill();
-    ctx.lineWidth = 3;
-    ctx.strokeStyle = accent;
+    ctx.strokeStyle = '#7dff8a';
+    ctx.lineWidth = 2;
     ctx.stroke();
+    ctx.fillStyle = '#dfe9e2';
+    ctx.font = 'bold 15px Georgia, serif';
     ctx.textAlign = 'center';
-    ctx.fillStyle = accent;
-    ctx.font = `bold 40px ${FONT}`;
-    ctx.fillText(title, FIELD.width / 2, y + 62);
-    ctx.fillStyle = PALETTE.text;
-    ctx.font = `17px ${FONT}`;
-    lines.forEach((line, i) => ctx.fillText(line, FIELD.width / 2, y + 108 + i * 30));
-    ctx.fillStyle = PALETTE.muted;
-    ctx.font = `15px ${FONT}`;
-    ctx.fillText(foot, FIELD.width / 2, y + h - 24);
-    ctx.textAlign = 'left';
+    ctx.fillText(upCost === null ? 'MAX LEVEL' : `⬆ Upgrade — ${upCost}g`, panel.x + 116, panel.y + 82);
+    ctx.fillStyle = '#7a3a2e';
+    rr(ctx, panel.x + 232, panel.y + 40, 200, 84, 10);
+    ctx.fill();
+    ctx.strokeStyle = '#ff8a8a';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    ctx.fillStyle = '#ffd7d7';
+    ctx.font = 'bold 15px Georgia, serif';
+    ctx.fillText(`Sell — ${sellValue(tower)}g`, panel.x + 332, panel.y + 82);
   }
+}
 
-  function drawTitle(state, best) {
-    overlay('EMBERLIGHT KEEP', [
-      'The last ember burns at the end of the road. The Gloam is coming.',
-      'Build towers on the stone plots. Stop every creature for 10 waves.',
-      'Click a plot to build · 1–4 pick a tower · Space calls the next wave',
-      'P pauses · F speeds up · M mutes · R restarts after the end',
-      best > 0 ? `Best score so far: ${best}` : 'No keeper has held the light yet — be the first.',
-    ], 'Click anywhere or press Space to begin', PALETTE.ember);
-  }
+function drawTitle(ctx, s, t) {
+  ctx.fillStyle = 'rgba(4,10,16,0.72)';
+  ctx.fillRect(0, 0, W, H);
+  drawFlame(ctx, W / 2 - 330, 380, 1.4, t, '#ff9a2a');
+  drawFlame(ctx, W / 2 + 330, 380, 1.4, t + 400, '#ff9a2a');
+  ctx.fillStyle = '#ffe9a8';
+  ctx.font = 'bold 64px Georgia, serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('EMBERLIGHT KEEP', W / 2, 150);
+  ctx.fillStyle = '#dfe9e2';
+  ctx.font = '22px Georgia, serif';
+  ctx.fillText('A tower defence of the last ember — hold the road through 10 waves of the Gloam.', W / 2, 205);
+  ctx.font = '18px Georgia, serif';
+  ctx.fillStyle = '#9fb8a8';
+  ctx.fillText('Build on the old stones · Upgrade to level 3 · Call waves early for bonus gold', W / 2, 240);
+  ctx.fillText('Spark Spire · Frost Lantern · Ember Cannon · Prism Obelisk', W / 2, 268);
+  // Start button (click target: x 480–800, y 340–420).
+  const pulse = 1 + Math.sin(t * 0.004) * 0.03;
+  ctx.save();
+  ctx.translate(W / 2, 380);
+  ctx.scale(pulse, pulse);
+  ctx.fillStyle = '#7a5a1e';
+  rr(ctx, -160, -40, 320, 80, 14);
+  ctx.fill();
+  ctx.strokeStyle = '#ffe9a8';
+  ctx.lineWidth = 3;
+  ctx.stroke();
+  ctx.fillStyle = '#ffe9a8';
+  ctx.font = 'bold 28px Georgia, serif';
+  ctx.fillText('BEGIN THE WATCH', 0, 2);
+  ctx.restore();
+  ctx.fillStyle = '#9fb8a8';
+  ctx.font = '16px Georgia, serif';
+  ctx.fillText('Mouse + keyboard · Space calls the next wave · P pause · F fast-forward · M mute · R restart', W / 2, 470);
+  ctx.fillText('Original art and sound, drawn and synthesised in code. No downloads, no accounts.', W / 2, 500);
+}
 
-  function drawPaused() {
-    overlay('PAUSED', ['The Gloam waits. The ember still burns.'], 'P or Esc to keep playing', PALETTE.muted);
-  }
-
-  function drawVictory(state) {
-    overlay('THE LIGHT HOLDS', [
-      `All ${WAVE_COUNT} waves broken against your towers.`,
-      `Score ${state.score} · ${state.kills} creatures stopped · ${state.stats.built} towers raised`,
-      `${state.emberHp} of ${EMBER.hp} ember hearts still burning — bonus earned.`,
-    ], 'Press R or click to play again', PALETTE.ok);
-  }
-
-  function drawDefeat(state) {
-    overlay('THE EMBER DIES', [
-      `The Gloam reached the lantern on wave ${Math.max(1, state.wave)}.`,
-      `Score ${state.score} · ${state.kills} creatures stopped · ${state.stats.leaks} slipped through`,
-      'Build closer to the bends, mix Frost with Cannon, and call waves early for gold.',
-    ], 'Press R or click to try again', PALETTE.danger);
-  }
-
-  function draw(state, screen, best, particles) {
-    fit();
-    ctx.setTransform(scale, 0, 0, scale, offsetX, offsetY);
-    ctx.save();
-    if (state.shake > 0) {
-      ctx.translate((Math.random() - 0.5) * state.shake * 18, (Math.random() - 0.5) * state.shake * 18);
-    }
-    drawBackground(state);
-    drawPath();
-    drawPlots(state);
-    drawEmber(state);
-    drawRange(state);
-    for (const tower of state.towers) drawTower(tower, state);
-    for (const enemy of state.enemies) drawEnemy(enemy, state);
-    drawProjectiles(state);
-    drawParticles(particles);
-    ctx.restore();
-    ctx.setTransform(scale, 0, 0, scale, offsetX, offsetY);
-    if (screen === SCREEN_PLAY || screen === SCREEN_PAUSED) {
-      drawHud(state, best);
-      if (state.selectedPlot !== null) drawBuildPanel(state);
-      drawBanner(state);
-    }
-    if (screen === SCREEN_TITLE) drawTitle(state, best);
-    else if (screen === SCREEN_PAUSED) drawPaused();
-    else if (screen === SCREEN_VICTORY) drawVictory(state);
-    else if (screen === SCREEN_DEFEAT) drawDefeat(state);
-  }
-
-  /** What a click at logical (x, y) hits: a HUD button, a panel card, or null. */
-  function uiHit(state, x, y) {
-    if (state.screen === SCREEN_PLAY || state.screen === SCREEN_PAUSED) {
-      if (y >= 10 && y <= 44) {
-        if (x >= 1060 && x <= 1118) return { action: 'speed' };
-        if (x >= 1126 && x <= 1184) return { action: 'pause' };
-        if (x >= 1192 && x <= 1250) return { action: 'mute' };
-      }
-      if (state.phase === 'build' && state.screen === SCREEN_PLAY) {
-        const label = state.wave === 0
-          ? `Start wave 1  (Space) — ${Math.ceil(state.buildTime)}s`
-          : `Call wave ${state.wave + 1} early +${25}  (Space) — ${Math.ceil(state.buildTime)}s`;
-        ctx.font = `bold 17px ${FONT}`;
-        const w = ctx.measureText(label).width + 36;
-        if (x >= FIELD.width / 2 - w / 2 && x <= FIELD.width / 2 + w / 2 && y >= FIELD.height - 52 && y <= FIELD.height - 14) {
-          return { action: 'call' };
-        }
-      }
-      if (state.selectedPlot !== null) {
-        const plot = PLOTS[state.selectedPlot];
-        const rect = panelRectFor(plot);
-        const tower = state.towers.find((t) => t.plotId === plot.id);
-        if (x >= rect.x && x <= rect.x + rect.w && y >= rect.y && y <= rect.y + rect.h) {
-          if (!tower) {
-            const cardW = (rect.w - 32 - 3 * 10) / 4;
-            for (let i = 0; i < 4; i += 1) {
-              const card = { x: rect.x + 16 + i * (cardW + 10), y: rect.y + 40, w: cardW, h: 84 };
-              if (x >= card.x && x <= card.x + card.w && y >= card.y && y <= card.y + card.h) {
-                return { action: 'build', kind: TOWER_ORDER[i] };
-              }
-            }
-          } else {
-            if (x >= rect.x + 16 && x <= rect.x + 266 && y >= rect.y + 72 && y <= rect.y + 116) return { action: 'upgrade' };
-            if (x >= rect.x + 282 && x <= rect.x + 462 && y >= rect.y + 72 && y <= rect.y + 116) return { action: 'sell' };
-            if (x >= rect.x + 478 && x <= rect.x + 604 && y >= rect.y + 72 && y <= rect.y + 116) return { action: 'close' };
-          }
-          return { action: 'panel' };
-        }
-      }
-    }
-    return null;
-  }
-
-  return { draw, uiHit, fit, panelRectFor };
+function drawEnd(ctx, s, win) {
+  ctx.fillStyle = win ? 'rgba(10,26,14,0.78)' : 'rgba(26,8,10,0.78)';
+  ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = win ? '#ffe9a8' : '#ff9a9a';
+  ctx.font = 'bold 58px Georgia, serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(win ? 'THE EMBER ENDURES' : 'THE EMBER HAS GONE OUT', W / 2, 200);
+  ctx.fillStyle = '#dfe9e2';
+  ctx.font = '22px Georgia, serif';
+  ctx.fillText(
+    win
+      ? `All 10 waves broken. ${s.kills} of the Gloam slain, ${s.emberHp}/${EMBER_MAX} hearts still burning.`
+      : `The Gloam overran the keep on wave ${s.wave}. ${s.kills} slain before the dark.`,
+    W / 2, 260,
+  );
+  ctx.fillStyle = '#ffe9a8';
+  ctx.font = 'bold 30px Georgia, serif';
+  ctx.fillText(`Score ${s.score}   ·   Kills ${s.kills}   ·   Gold earned ${s.stats.earned}g`, W / 2, 320);
+  ctx.fillStyle = '#9fb8a8';
+  ctx.font = '18px Georgia, serif';
+  ctx.fillText(win ? 'The keep stands. Light the watch again whenever you like.' : 'Raise stronger towers and try the watch again.', W / 2, 360);
+  ctx.fillStyle = '#7a5a1e';
+  rr(ctx, 480, 430, 320, 70, 14);
+  ctx.fill();
+  ctx.strokeStyle = '#ffe9a8';
+  ctx.lineWidth = 3;
+  ctx.stroke();
+  ctx.fillStyle = '#ffe9a8';
+  ctx.font = 'bold 26px Georgia, serif';
+  ctx.fillText('PLAY AGAIN  (R)', W / 2, 466);
 }

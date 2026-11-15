@@ -1,146 +1,139 @@
-// Towers: what they cost, how they aim and fire, and the shells and beams they
-// throw. A tower is a plain object on a plot; projectiles live here too, as short
-// flights from a muzzle to a target with a splash on arrival.
-import {
-  DAMAGE_PER_LEVEL, MAX_LEVEL, RANGE_PER_LEVEL, SELL_SHARE, TOWERS, UPGRADE_SHARE,
-} from './config.js';
-import { chillEnemy, hurtEnemy } from './enemies.js';
+// Emberlight Keep — tower behaviour: targeting, firing, projectiles.
+// Pure rules; rendering lives in render.js.
 
-let nextId = 1;
+import { towerStats } from './config.js';
+import { pointAt, TOTAL_PATH } from './level.js';
 
-/** Stats for a tower kind at a level: damage, range and fire rate. */
-export function towerStats(kind, level) {
-  const base = TOWERS[kind];
-  return {
-    ...base,
-    damage: Math.round(base.damage * Math.pow(DAMAGE_PER_LEVEL, level - 1)),
-    range: Math.round(base.range * Math.pow(RANGE_PER_LEVEL, level - 1)),
-    rate: base.rate,
-  };
+export function towerAtPlot(state, plotId) {
+  return state.towers.find((t) => t.plotId === plotId) || null;
 }
 
-/** Price to raise a tower to the next level (0 when already at the top). */
-export function upgradeCost(tower) {
-  if (tower.level >= MAX_LEVEL) return 0;
-  return Math.round(TOWERS[tower.kind].cost * UPGRADE_SHARE * tower.level);
+export function towerById(state, id) {
+  return state.towers.find((t) => t.id === id) || null;
 }
 
-/** Gold returned for selling a tower. */
-export function sellValue(tower) {
-  return Math.floor(tower.spent * SELL_SHARE);
-}
-
-/** Place a fresh level-1 tower of `kind` on `plot`. */
-export function buildTower(kind, plot) {
-  const stats = towerStats(kind, 1);
-  return {
-    id: nextId++,
-    kind,
-    plotId: plot.id,
-    x: plot.x,
-    y: plot.y,
-    level: 1,
-    spent: stats.cost,
-    cooldown: 0,
-    angle: -Math.PI / 2,
-    flash: 0,
-    ...stats,
-  };
-}
-
-/** Raise a tower one level, refreshing its stats. */
-export function upgradeTower(tower) {
-  const cost = upgradeCost(tower);
-  if (cost === 0) return 0;
-  tower.spent += cost;
-  tower.level += 1;
-  const stats = towerStats(tower.kind, tower.level);
-  tower.damage = stats.damage;
-  tower.range = stats.range;
-  tower.rate = stats.rate;
-  return cost;
-}
-
-/** Pick the target: the enemy furthest along the path inside range. */
-function pickTarget(tower, enemies) {
+// Furthest-along-the-road enemy inside range (deterministic: ties by id).
+export function acquireTarget(tower, enemies, range) {
   let best = null;
-  let bestDistance = -1;
-  for (const enemy of enemies) {
-    if (enemy.dead || enemy.leaked) continue;
-    const dx = enemy.x - tower.x;
-    const dy = enemy.y - tower.y;
-    if (dx * dx + dy * dy > tower.range * tower.range) continue;
-    if (enemy.distance > bestDistance) {
-      bestDistance = enemy.distance;
-      best = enemy;
+  let bestDist = -1;
+  for (const e of enemies) {
+    const d = Math.hypot(e.x - tower.x, e.y - tower.y);
+    if (d <= range && (e.dist > bestDist || (e.dist === bestDist && best && e.id < best.id))) {
+      best = e;
+      bestDist = e.dist;
     }
   }
   return best;
 }
 
-/**
- * Fire one tower for a step. Returns events the game turns into sound and
- * particles: { type: 'shot'|'beam'|'chill', ... }. Damage is applied here for
- * instant weapons; shells fly and burst in stepProjectiles.
- */
-export function stepTower(tower, enemies, projectiles, dt, time, random) {
-  tower.cooldown -= dt;
-  tower.flash = Math.max(0, tower.flash - dt * 6);
-  if (tower.cooldown > 0) return null;
-  const target = pickTarget(tower, enemies);
-  if (!target) return null;
+export function fireTower(state, tower, target, now) {
+  const stats = towerStats(tower.kind, tower.level);
   tower.angle = Math.atan2(target.y - tower.y, target.x - tower.x);
-  tower.cooldown = 1 / tower.rate;
-  tower.flash = 1;
-  const def = TOWERS[tower.kind];
-  if (tower.kind === 'cannon') {
-    projectiles.push({
-      kind: 'shell', x: tower.x, y: tower.y - 14,
-      targetId: target.id, tx: target.x, ty: target.y,
-      speed: 420, damage: tower.damage, splash: def.splash, color: def.color,
-      trail: 0,
-    });
-    return { type: 'shot', kind: 'shell', x: tower.x, y: tower.y };
-  }
+  tower.cooldown = 1 / stats.rate;
   if (tower.kind === 'prism') {
-    const killed = hurtEnemy(target, tower.damage);
-    return { type: 'beam', kind: 'beam', fromX: tower.x, fromY: tower.y - 16, toX: target.x, toY: target.y, target, killed };
+    // Instant chain light: hit the target and up to 2 nearest others.
+    const near = state.enemies
+      .filter((e) => e !== target && Math.hypot(e.x - target.x, e.y - target.y) <= 110)
+      .sort((a, b) => Math.hypot(a.x - target.x, a.y - target.y) - Math.hypot(b.x - target.x, b.y - target.y))
+      .slice(0, stats.chain - 1);
+    const hit = [target, ...near];
+    for (const e of hit) damageEnemy(state, e, stats.damage, tower);
+    state.fx.push({ kind: 'beam', x1: tower.x, y1: tower.y, x2: target.x, y2: target.y, ttl: 0.18, max: 0.18, color: stats.color });
+    state.audio.shoot('prism');
+    return;
   }
-  if (tower.kind === 'frost') {
-    chillEnemy(target, def.slow, def.slowTime, time);
-    const killed = hurtEnemy(target, tower.damage);
-    return { type: 'chill', kind: 'chill', target, killed, x: target.x, y: target.y };
-  }
-  const killed = hurtEnemy(target, tower.damage);
-  return { type: 'shot', kind: 'bolt', fromX: tower.x, fromY: tower.y - 14, toX: target.x, toY: target.y, target, killed };
+  state.projectiles.push({
+    x: tower.x,
+    y: tower.y - 14,
+    targetId: target.id,
+    tx: target.x,
+    ty: target.y,
+    speed: stats.projSpeed,
+    damage: stats.damage,
+    splash: stats.splash,
+    slow: stats.slow,
+    slowDur: stats.slowDur,
+    kind: tower.kind,
+    towerId: tower.id,
+    color: stats.color,
+  });
+  state.audio.shoot(tower.kind);
 }
 
-/** Move shells toward their targets; burst and splash on arrival. */
-export function stepProjectiles(projectiles, enemies, dt, random) {
-  const bursts = [];
-  for (let i = projectiles.length - 1; i >= 0; i -= 1) {
-    const shell = projectiles[i];
-    const dx = shell.tx - shell.x;
-    const dy = shell.ty - shell.y;
-    const dist = Math.hypot(dx, dy);
-    const move = shell.speed * dt;
-    if (dist <= move + 6) {
-      projectiles.splice(i, 1);
-      const hit = [];
-      for (const enemy of enemies) {
-        if (enemy.dead || enemy.leaked) continue;
-        if (Math.hypot(enemy.x - shell.tx, enemy.y - shell.ty) <= shell.splash) {
-          if (hurtEnemy(enemy, shell.damage)) hit.push(enemy);
-        }
-      }
-      bursts.push({ x: shell.tx, y: shell.ty, radius: shell.splash, killed: hit });
-    } else {
-      shell.x += (dx / dist) * move;
-      shell.y += (dy / dist) * move;
-      shell.trail += dt;
+export function damageEnemy(state, enemy, dmg, tower) {
+  if (enemy.hp <= 0) return;
+  enemy.hp -= dmg;
+  enemy.flash = 0.12;
+  if (enemy.hp <= 0) {
+    state.kills += 1;
+    state.gold += enemy.reward;
+    state.score += 25;
+    state.stats.earned += enemy.reward;
+    if (tower) tower.kills += 1;
+    state.fx.push({ kind: 'burst', x: enemy.x, y: enemy.y, ttl: 0.35, max: 0.35, color: enemy.color });
+    state.audio.hit();
+  }
+}
+
+export function updateProjectiles(state, dt) {
+  const keep = [];
+  for (const p of state.projectiles) {
+    const target = state.enemies.find((e) => e.id === p.targetId);
+    if (target) {
+      p.tx = target.x;
+      p.ty = target.y;
     }
+    const dx = p.tx - p.x;
+    const dy = p.ty - p.y;
+    const d = Math.hypot(dx, dy);
+    const step = p.speed * dt;
+    if (d <= Math.max(step, 10)) {
+      // Impact.
+      if (p.splash > 0) {
+        const tower = state.towers.find((t) => t.id === p.towerId);
+        for (const e of [...state.enemies]) {
+          if (Math.hypot(e.x - p.tx, e.y - p.ty) <= p.splash) damageEnemy(state, e, p.damage, tower);
+        }
+        state.fx.push({ kind: 'ring', x: p.tx, y: p.ty, ttl: 0.3, max: 0.3, color: p.color, r: p.splash });
+      } else if (target && target.hp > 0) {
+        const tower = state.towers.find((t) => t.id === p.towerId);
+        if (p.slow > 0) {
+          target.slowUntil = state.time + p.slowDur;
+          target.slowFactor = 1 - p.slow;
+        }
+        damageEnemy(state, target, p.damage, tower);
+      }
+      continue;
+    }
+    p.x += (dx / d) * step;
+    p.y += (dy / d) * step;
+    keep.push(p);
   }
-  return bursts;
+  state.projectiles = keep;
 }
 
-export function resetTowerIds() { nextId = 1; }
+export function updateEnemies(state, dt) {
+  const keep = [];
+  for (const e of state.enemies) {
+    if (e.hp <= 0) continue;
+    const slowed = state.time < e.slowUntil;
+    const speed = e.speed * (slowed ? e.slowFactor : 1);
+    e.dist += speed * dt;
+    e.flash = Math.max(0, e.flash - dt);
+    if (e.dist >= TOTAL_PATH) {
+      // Reached the ember.
+      state.emberHp = Math.max(0, state.emberHp - e.leak);
+      state.stats.leaks += 1;
+      state.score = Math.max(0, state.score - 40);
+      state.fx.push({ kind: 'leak', x: e.x, y: e.y, ttl: 0.5, max: 0.5, color: '#ff5c5c' });
+      state.audio.leak();
+      continue;
+    }
+    const pos = pointAt(e.dist);
+    e.x = pos.x;
+    e.y = pos.y;
+    e.seg = pos.seg;
+    keep.push(e);
+  }
+  state.enemies = keep;
+}

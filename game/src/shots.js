@@ -1,137 +1,109 @@
-// Screenshot scenes behind ?shot=start|play|victory|defeat. Each one plays the
-// real rules forward from a fresh game for a fixed number of steps, steered by a
-// simple autopilot that builds towers on the best plots, upgrades them and calls
-// waves early — so the frame is what a real game looks like, and the same seed
-// always gives the same frame.
-import { STEP, TOWER_ORDER, TOWERS, WAVE_COUNT } from './config.js';
+// Emberlight Keep — deterministic screenshot scenes (?shot=...&seed=...).
+// Each scene is staged by actually playing the real rules: the victory
+// scene is a full honest autopilot win, the defeat scene a no-tower loss.
+
+import { SCREEN_DEFEAT, SCREEN_VICTORY } from './config.js';
 import { PLOTS } from './level.js';
-import { SCREEN_DEFEAT, SCREEN_PLAY, SCREEN_TITLE, SCREEN_VICTORY } from './game.js';
+import { TOWERS } from './config.js';
+import { STEP } from './config.js';
 
-const SAMPLE = STEP;
+const RANKED = [...PLOTS].sort((a, b) => b.value - a.value);
 
-/** Plots sorted by value (path covered), best first. */
-const RANKED_PLOTS = [...PLOTS].sort((a, b) => b.value - a.value);
-
-/** Spend the gold on hand: best plots first, Cannon on bends, then upgrades. */
-function autopilotBuild(game) {
-  const state = game.state;
-  // Fill empty plots with the best affordable tower for that plot.
-  for (const plot of RANKED_PLOTS) {
-    if (state.towers.some((t) => t.plotId === plot.id)) continue;
-    const kind = plot.value >= 60 ? 'cannon' : plot.value >= 45 ? 'spark' : 'spark';
-    if (state.gold >= TOWERS[kind].cost) {
-      state.selectedPlot = plot.id;
+export function autopilotBuild(game) {
+  const s = game.state;
+  for (const plot of RANKED) {
+    if (s.towers.some((t) => t.plotId === plot.id)) continue;
+    const kind = plot.value >= 60 ? 'cannon' : 'spark';
+    if (s.gold >= TOWERS[kind].cost) {
+      s.selectedPlot = plot.id;
       game.buildSelected(kind);
     }
   }
-  // Upgrade the cheapest tower we can afford, lowest level first.
-  let upgraded = true;
-  while (upgraded) {
-    upgraded = false;
-    const tower = [...state.towers].sort((a, b) => a.level - b.level || a.spent - b.spent)[0];
+  let up = true;
+  while (up) {
+    up = false;
+    const tower = [...s.towers].sort((a, b) => a.level - b.level || a.spent - b.spent)[0];
     if (!tower) break;
     const cost = Math.round(TOWERS[tower.kind].cost * 0.8 * tower.level);
-    if (tower.level < 3 && state.gold >= cost) {
-      state.selectedTower = tower.id;
-      if (game.upgradeSelected()) upgraded = true;
+    if (tower.level < 3 && s.gold >= cost) {
+      s.selectedTower = tower.id;
+      if (game.upgradeSelected()) up = true;
     }
   }
-  state.selectedPlot = null;
-  state.selectedTower = null;
+  s.selectedPlot = null;
+  s.selectedTower = null;
 }
 
-/** Run the simulation forward until `stop(state)` is true or `maxSteps` pass.
- * Between waves the autopilot spends its gold and calls the next wave early,
- * unless `build` is false (the defeat scene: no towers at all). */
-function runUntil(game, maxSteps, stop, build = true) {
-  for (let i = 0; i < maxSteps; i += 1) {
-    if (build && game.state.phase === 'build') {
-      autopilotBuild(game);
-      game.startWave(true);
+function stepUntil(game, cond, maxSteps) {
+  let steps = 0;
+  while (steps < maxSteps) {
+    if (cond()) return true;
+    if (game.state.screen === 'play') {
+      if (game.state.phase === 'build' && game.state.wave < 10) {
+        autopilotBuild(game);
+        game.startWave(true);
+      }
+      game.update(STEP);
+    } else {
+      return cond();
     }
-    game.update(SAMPLE);
-    if (stop(game.state)) break;
-    if (game.state.screen !== SCREEN_PLAY) break;
+    steps += 1;
   }
+  return cond();
 }
 
-/**
- * Set the game to the named scene (start, play, victory, defeat; any other name
- * is start) and return the screen to draw over it and the best score to show.
- */
 export function stageShot(name, game) {
-  const state = game.state;
-  game.reset();
-  if (name !== 'play' && name !== 'victory' && name !== 'defeat') {
-    // Title: a few towers already standing, wave 1 waiting to be called.
+  if (name === 'start') {
     game.startRun();
-    state.selectedPlot = RANKED_PLOTS[0].id;
+    const st = game.state;
+    // Decorative title scene: two towers already standing watch.
+    st.gold = 1000;
+    st.selectedPlot = PLOTS[0].id;
     game.buildSelected('spark');
-    state.selectedPlot = RANKED_PLOTS[1].id;
-    game.buildSelected('frost');
-    state.selectedPlot = null;
-    state.screen = SCREEN_TITLE;
-    state.time = 4;
-    return { screen: SCREEN_TITLE, best: 0 };
+    st.selectedPlot = PLOTS[5].id;
+    game.buildSelected('cannon');
+    st.screen = 'title';
+    st.phase = 'build';
+    st.wave = 0;
+    st.selectedPlot = null;
+    st.selectedTower = null;
+    return snapshot(game.state);
   }
-
-  if (name === 'defeat') {
-    // No towers at all: the Gloam walks straight through to the ember.
+  if (name === 'play') {
     game.startRun();
-    game.startWave(true);
-    runUntil(game, 60 * 240, (s) => s.screen === SCREEN_DEFEAT, false);
-    if (state.screen !== SCREEN_DEFEAT) {
-      // Fallback: the state the defeat screen shows, reached honestly by leaks.
-      state.emberHp = 0;
-      state.screen = SCREEN_DEFEAT;
-      state.phase = 'done';
-    }
-    return { screen: SCREEN_DEFEAT, best: state.score };
+    stepUntil(game, () => game.state.wave >= 2 && game.state.enemies.length >= 6, 60 * 600);
+    return snapshot(game.state);
   }
-
   if (name === 'victory') {
     game.startRun();
-    autopilotBuild(game);
-    game.startWave(true);
-    runUntil(game, 60 * 1500, (s) => s.screen === SCREEN_VICTORY || s.screen === SCREEN_DEFEAT);
-    if (state.screen !== SCREEN_VICTORY) {
-      // The autopilot fell short: restage the victory honestly from a won run's
-      // shape — towers standing, wave 10 cleared, ember hearts left.
-      game.reset();
-      game.startRun();
-      for (const plot of RANKED_PLOTS.slice(0, 8)) {
-        state.selectedPlot = plot.id;
-        game.buildSelected(plot.value >= 60 ? 'cannon' : 'spark');
-      }
-      for (const tower of [...state.towers]) {
-        state.selectedTower = tower.id;
-        game.upgradeSelected();
-        game.upgradeSelected();
-      }
-      state.wave = WAVE_COUNT;
-      state.phase = 'done';
-      state.screen = SCREEN_VICTORY;
-      state.score = 5240;
-      state.kills = 212;
-      state.gold = 340;
-      state.selectedPlot = null;
-      state.selectedTower = null;
-    }
-    return { screen: SCREEN_VICTORY, best: state.score };
+    stepUntil(game, () => game.state.screen === SCREEN_VICTORY, 60 * 1800);
+    return snapshot(game.state);
   }
-
-  // Play: a mid-game fight — towers up, wave 3 in full swing.
-  game.startRun();
-  autopilotBuild(game);
-  game.startWave(true);
-  runUntil(game, 60 * 200, (s) => s.wave >= 3 && s.phase === 'wave' && s.enemies.length >= 6);
-  if (state.screen !== SCREEN_PLAY) {
-    game.reset();
+  if (name === 'defeat') {
     game.startRun();
-    autopilotBuild(game);
-    game.startWave(true);
-    runUntil(game, 60 * 120, () => false);
+    let steps = 0;
+    while (game.state.screen === 'play' && steps < 60 * 1800) {
+      // No towers at all: keep calling waves until the ember dies.
+      if (game.state.phase === 'build' && game.state.wave < 10) game.startWave(true);
+      game.update(STEP);
+      steps += 1;
+    }
+    return snapshot(game.state);
   }
-  state.selectedPlot = null;
-  return { screen: SCREEN_PLAY, best: state.score };
+  // Unknown scene: plain title.
+  game.startRun();
+  game.state.screen = 'title';
+  return snapshot(game.state);
+}
+
+function snapshot(s) {
+  return {
+    screen: s.screen,
+    wave: s.wave,
+    kills: s.kills,
+    score: s.score,
+    emberHp: s.emberHp,
+    towers: s.towers.length,
+    enemies: s.enemies.length,
+  };
 }
