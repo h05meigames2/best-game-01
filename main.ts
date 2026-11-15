@@ -1,41 +1,97 @@
-// A working best-game-01 entry (Node 22, standard library only): the game is this directory's
-// game/ folder, plain static files a desktop browser loads offline (game/index.html and its ES
-// modules, no library and no network request), and the program hands it in. It copies game/ and
-// screenshots/ from beside this file to /output and writes /output/dossier.json, the summary the
-// judge reads, with the vendored make.fun library. A starting point, not a winner: Block Dodger, a
-// plain 2D canvas game where a paddle dodges falling blocks and catches coins, with a title screen,
-// score, lives and levels, game over and restart, flat colours and no sound. Build your own game
-// (any genre, any library you vendor under game/, or none), put your 3 or 4 PNG or JPEG screenshots
-// in screenshots/ (the first by name is the cover) and run it.
+// Emberlight Keep — hand-in entrypoint for best-game-01.
 //
-// Serve it locally with `node serve.ts`, then open http://localhost:8080.
-// Outside the grader's container, MAKEFUN_OUTPUT_DIR stands in for /output:
-//   mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts
+// What this program does, in its own words: it gathers the finished game
+// (game/) and its screenshots (screenshots/) into one output folder, then
+// asks the kit library to describe that folder as a dossier.json the
+// competition's scorer can re-derive byte for byte.
+//
+// It runs on Node 22+ with nothing but the standard library. The grader
+// runs it twice in a sandbox with no network; the two runs must agree, so
+// every step below is deterministic: no timestamps, no random choices, no
+// dependence on the order the filesystem happens to list things in.
 
-import { cpSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { cpSync, existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { buildDossier } from './vendor/makefun-game.ts';
 
-const here = fileURLToPath(new URL('.', import.meta.url));
-const out = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
+// The competition's own limits for this entry (reference/gate.json):
+// text at most 160 KiB, at most 4 screenshots of at most 256 KiB each,
+// game/ at most 993 entries and 48 MiB, each path at most 1000 bytes.
+const DOSSIER_LIMITS = {
+  text_max_bytes: 163840,
+  screenshots: { max: 4, max_bytes: 262144 },
+  game_max_files: 993,
+  game_max_bytes: 50331648,
+  game_path_max_bytes: 1000,
+} as const;
 
-mkdirSync(out, { recursive: true });
-cpSync(join(here, 'game'), join(out, 'game'), { recursive: true });
-mkdirSync(join(out, 'screenshots'), { recursive: true });
-if (existsSync(join(here, 'screenshots'))) cpSync(join(here, 'screenshots'), join(out, 'screenshots'), { recursive: true });
+// The two trees this entry hands in, in the order they are staged.
+const HANDED_IN_TREES = ['screenshots', 'game'] as const;
 
-// The scorer's own caps (reference/gate.json): only text_max_bytes shapes the bytes; the others refuse an entry the
-// scorer would refuse (more than 4 screenshots or one over 256 KiB; more than 993 files in game/ or 48 MiB of game
-// files, in all, or a path under game/ over 1000 bytes: game/ counts beside /output's own 1000-entry cap, its
-// screenshots/ and dossier.json).
-writeFileSync(
-  join(out, 'dossier.json'),
-  buildDossier(out, {
-    text_max_bytes: 163840,
-    screenshots: { max: 4, max_bytes: 262144 },
-    game_max_files: 993,
-    game_max_bytes: 50331648,
-    game_path_max_bytes: 1000,
-  }),
-);
+// Where the finished entry lands. The grader writes to /output; outside
+// the grader MAKEFUN_OUTPUT_DIR stands in for it.
+function pickOutputDir(): string {
+  const envDir = process.env.MAKEFUN_OUTPUT_DIR;
+  const chosen = envDir !== undefined && envDir.trim() !== '' ? envDir : '/output';
+  return resolve(chosen);
+}
+
+// The repository root is the folder this file lives in, whatever the
+// working directory the program was started from.
+function repoRoot(): string {
+  return dirname(fileURLToPath(import.meta.url));
+}
+
+// Start from a clean slate so a stale file from an earlier run can never
+// leak into this entry.
+function resetOutputDir(outDir: string): void {
+  if (existsSync(outDir)) {
+    rmSync(outDir, { recursive: true, force: true });
+  }
+  mkdirSync(outDir, { recursive: true });
+}
+
+// Copy one tree (game/ or screenshots/) verbatim into the output folder.
+function stageTree(root: string, treeName: string, outDir: string): number {
+  const source = join(root, treeName);
+  const target = join(outDir, treeName);
+  cpSync(source, target, { recursive: true });
+  return countEntries(target);
+}
+
+// How many files and directories a tree holds, for the run summary.
+function countEntries(dir: string): number {
+  let total = 0;
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    total += 1;
+    if (entry.isDirectory()) total += countEntries(join(dir, entry.name));
+  }
+  return total;
+}
+
+// Ask the kit library to describe the staged entry and save its answer.
+function writeDossier(outDir: string): number {
+  const dossierBytes = buildDossier(outDir, DOSSIER_LIMITS);
+  const dossierPath = join(outDir, 'dossier.json');
+  writeFileSync(dossierPath, dossierBytes);
+  return statSync(dossierPath).size;
+}
+
+function handInEntry(): void {
+  const root = repoRoot();
+  const outDir = pickOutputDir();
+  resetOutputDir(outDir);
+  const staged: Record<string, number> = {};
+  for (const treeName of HANDED_IN_TREES) {
+    staged[treeName] = stageTree(root, treeName, outDir);
+  }
+  const dossierBytes = writeDossier(outDir);
+  console.log(`Emberlight Keep handed in to ${outDir}`);
+  for (const treeName of HANDED_IN_TREES) {
+    console.log(`  ${treeName}/: ${staged[treeName]} entries`);
+  }
+  console.log(`  dossier.json: ${dossierBytes} bytes`);
+}
+
+handInEntry();
